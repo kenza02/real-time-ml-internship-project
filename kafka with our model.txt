@@ -1,0 +1,140 @@
+from confluent_kafka import Producer, Consumer, KafkaError
+from urllib.request import urlopen, Request
+from bs4 import BeautifulSoup
+import requests
+from datetime import datetime, timedelta
+from langdetect import detect
+import json
+import time
+import joblib
+import pandas as pd
+import torch
+from transformers import pipeline
+
+# Load your pre-trained model
+model = joblib.load('meilleur_modele.pkl')  # Replace with the actual path to your model file
+
+# Initialize a sentiment analysis pipeline (use the same one you trained earlier)
+nlp = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment")
+
+# Confluent Cloud configuration
+kafka_config = {
+    'bootstrap.servers': 'pkc-6ojv2.us-west4.gcp.confluent.cloud:9092',  # Replace with your Confluent Cloud cluster endpoint
+    'security.protocol': 'SASL_SSL',
+    'sasl.mechanisms': 'PLAIN',
+    'sasl.username': 'OHJBVVTENO4E7FUZ',  # Replace with your Confluent Cloud API key
+    'sasl.password': '4l9JTmflJX16eH+Q4o1HBFv4Mf5Dd2ADy9qrsXANW2hIU/0CDueeMIDGtgHa7gjs',  # Replace with your Confluent Cloud API secret
+}
+
+# Create a Kafka producer instance
+producer = Producer(kafka_config)
+
+# Kafka topic to publish real-time news articles
+topic = 'Tesla_News_Articles'
+
+root = "https://www.google.com/"
+link_base = "https://www.google.com/search?q=tesla&sca_esv=560664892&rlz=1C1GCEA_enMA1047MA1047&tbs=qdr:d,sbd:1&tbm=nws&ei=Y5bsZN2fFpiekdUPofa8QA&start=0&sa=N&ved=2ahUKEwid3fbNsP-AAxUYT6QEHSE7Dwg4MhDy0wN6BAgDEAQ&biw=1366&bih=651&dpr=1&lr=lang_en"
+
+while True:
+    req = Request(link_base, headers={'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'})
+    webpage = urlopen(req).read()
+
+    with requests.Session() as c:
+        soup = BeautifulSoup(webpage, 'html.parser')
+        articles = soup.find_all('a', class_='WlydOe')
+
+    for article in articles:
+        time_element = article.find('div', class_='OSrXXb')
+        title_element = article.find('div', class_='n0jPhd')
+        description_element = article.find('div', class_='GI74Re')
+
+        if time_element:
+            time_string = time_element.span.get_text()
+            if "min" in time_string:
+                minutes_ago = int(time_string.split()[0])
+                pub_time = datetime.now() - timedelta(minutes=minutes_ago)
+            elif "hour" in time_string:
+                hours_ago = int(time_string.split()[0])
+                pub_time = datetime.now() - timedelta(hours=hours_ago)
+            else:
+                pub_time = datetime.now()
+        else:
+            pub_time = datetime.now()
+
+        date_str = pub_time.strftime("%Y-%m-%d")
+        time_str = pub_time.strftime("%H:%M:%S")
+
+        if title_element:
+            title = title_element.get_text()
+        else:
+            title = "N/A"
+
+        if description_element:
+            description = description_element.get_text()
+        else:
+            description = "N/A"
+
+        description_language = detect(description)
+        if description_language == 'en':
+            article_data = {
+                'Date': date_str,
+                'Time': time_str,
+                'Title': title,
+                'Description': description
+            }
+
+            # Convert the article data to a JSON string
+            article_json = json.dumps(article_data)
+
+            # Perform sentiment analysis on the article's description
+            sentiment = nlp(description)[0]
+
+            # Extract features from the article and make a prediction
+            # Replace this with your feature extraction logic and prediction code
+            # Ensure that the features match the ones used during model training
+            article_features = extract_features_from_article(description)
+            predicted_price = model.predict(article_features)
+
+            # Publish the real-time news article and prediction to the Kafka topic
+            producer.produce(topic=topic, key=None, value=article_json)
+
+    # Wait for a while before fetching the next batch of news articles
+    time.sleep(3600)  # Fetch new articles every hour
+
+    # Close the Kafka producer
+    producer.flush()
+
+    consumer_config = {
+        'bootstrap.servers': 'pkc-6ojv2.us-west4.gcp.confluent.cloud:9092',  # Replace with your Confluent Cloud cluster endpoint
+        'security.protocol': 'SASL_SSL',
+        'sasl.mechanisms': 'PLAIN',
+        'sasl.username': 'OHJBVVTENO4E7FUZ',  # Replace with your Confluent Cloud API key
+        'sasl.password': '4l9JTmflJX16eH+Q4o1HBFv4Mf5Dd2ADy9qrsXANW2hIU/0CDueeMIDGtgHa7gjs',  # Replace with your Confluent Cloud API secret
+        'group.id': 'my-consumer-group',  # Choose a unique consumer group ID
+        'auto.offset.reset': 'earliest'  # Start consuming from the beginning of the topic
+    }
+
+    # Create a Kafka consumer instance
+    consumer = Consumer(consumer_config)
+
+    # Kafka topic to consume real-time news articles
+    consumer.subscribe([topic])  # Subscribe to the same topic where you publish
+
+    # Continuously poll for new articles and process them
+    while True:
+        msg = consumer.poll(1.0)  # Poll for new messages with a timeout of 1 second
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(f'Error: {msg.error()}')
+                break
+
+        # Process the received message (in this case, print it)
+        article_json = msg.value().decode('utf-8')
+        print(f'Received article: {article_json}')
+
+    # Close the Kafka consumer when done
+    consumer.close()
